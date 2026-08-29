@@ -1,31 +1,42 @@
 # DeepFace gender-analysis server for Le Cocon's user verification.
 #
 # Endpoint:  POST /analyze
-#   Accepts:  multipart/form-data with `image` (file), OR JSON {"image_base64": "..."}
+#   Accepts:  multipart/form-data with `image`, OR JSON {"image_base64": "..."}
 #   Returns:  {"ok": true, "gender": "Woman"|"Man"|null, "confidence": <0-100>|null,
 #              "faceFound": bool, "note": "...", "error": null}
 #             or {"ok": false, "error": "..."}
 #
-# Run locally (downloads models on first request):
-#   pip install flask deepface opencv-python-headless
-#   python app.py
+# Run on the VPS with gunicorn:
+#   ./venv/bin/gunicorn --workers 1 --threads 1 --timeout 600 -b 0.0.0.0:8000 app:app
 #
-# The Supabase edge function calls this at the DEEPFACE_URL secret.
+# Memory notes (important on a 2-vCPU/4GB VPS):
+#   - We cap TensorFlow to 2 threads and the OpenCV detector backend, which keeps
+#     peak RAM low enough for the gender model (~537MB) to fit comfortably.
+#   - gc.collect() frees memory between requests (few verifications/day = idle
+#     in between, so this is effective).
 
 import base64
+import gc
 import io
 import os
 
-from flask import Flask, jsonify, request
+# Limit TensorFlow/OpenMP CPU threads BEFORE tensorflow is imported, to cut peak
+# memory use dramatically on a small VPS.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "2")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "2")
+
+from flask import Flask, jsonify, request  # noqa: E402
 
 app = Flask(__name__)
 
-# Import lazily so that if deepface isn't installed yet, the server still
-# starts and returns a clear error message instead of crashing.
+DETECTOR_BACKEND = "opencv"  # lightweight; avoids the heavier retinaface/mediapipe
 DEEP_FACE = None
 
 
 def _get_deepface():
+    """Load DeepFace once (lazy singleton) and reuse it across requests."""
     global DEEP_FACE
     if DEEP_FACE is None:
         try:
@@ -37,7 +48,6 @@ def _get_deepface():
 
 
 def _load_image_bytes():
-    """Return raw image bytes from either multipart `image` or `image_base64`."""
     if request.files and "image" in request.files:
         return request.files["image"].read()
     payload = request.get_json(silent=True) or {}
@@ -64,19 +74,18 @@ def analyze():
         df = _get_deepface()
         image_path = _bytes_to_temp(raw)
 
-        # Analyze only the gender attribute. enforce_detection=False means a
-        # missing face won't raise; it returns an empty list instead.
         try:
             results = df.analyze(
                 img_path=image_path,
                 actions=["gender"],
                 enforce_detection=False,
+                detector_backend=DETECTOR_BACKEND,
                 silent=True,
             )
-        except Exception as e:  # noqa: BLE001 - some deepface versions raise on no face
+        except Exception as e:  # noqa: BLE001 - some versions raise when no face
             results = []
 
-        # DeepFace pre-2023 returns a dict; newer versions return a list.
+        # DeepFace <2023 returns a dict; newer returns a list.
         if isinstance(results, list):
             results = results[0] if results else None
         if not results:
@@ -91,21 +100,21 @@ def analyze():
             )
 
         gender_obj = results.get("gender") or {}
-        # DeepFace returns {Woman: prob, Man: prob} (probs sum to ~1).
         prob_woman = float(gender_obj.get("Woman", 0) or 0)
         prob_man = float(gender_obj.get("Man", 0) or 0)
         confidence = max(prob_woman, prob_man) * 100.0
         gender = "Woman" if prob_woman >= prob_man else "Man"
 
-        return jsonify(
-            {
-                "ok": True,
-                "gender": gender,
-                "confidence": round(confidence, 1),
-                "faceFound": True,
-                "note": f"DeepFace: {gender} {round(confidence, 1)}%",
-            }
-        )
+        response = {
+            "ok": True,
+            "gender": gender,
+            "confidence": round(confidence, 1),
+            "faceFound": True,
+            "note": f"DeepFace: {gender} {round(confidence, 1)}%",
+        }
+
+        _cleanup(image_path)
+        return jsonify(response)
     except RuntimeError as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     except Exception as e:  # noqa: BLE001
@@ -113,13 +122,22 @@ def analyze():
 
 
 def _bytes_to_temp(raw: bytes) -> str:
-    """Write bytes to a temp file so DeepFace can read them."""
     import tempfile
 
     fd, path = tempfile.mkstemp(suffix=".jpg")
     with os.fdopen(fd, "wb") as f:
         f.write(raw)
     return path
+
+
+def _cleanup(path: str | None):
+    """Free temp file + run GC so peak memory stays low between requests."""
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    gc.collect()
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@
 # Run: ./venv/bin/gunicorn --workers 1 --threads 1 --timeout 120 -b 0.0.0.0:8000 app:app
 
 import base64
+import hmac
 import os
 import tempfile
 
@@ -18,6 +19,8 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from flask import Flask, jsonify, request
+
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
@@ -121,8 +124,18 @@ def health():
     return jsonify({"ok": True, "service": "lecocon-verify"})
 
 
+def _authorized() -> bool:
+    """Constant-time check of the shared secret token in the 'x-verify-token' header."""
+    if not VERIFY_TOKEN:
+        return True  # allow when token not configured yet (safe during setup)
+    provided = request.headers.get("x-verify-token", "")
+    return hmac.compare_digest(provided, VERIFY_TOKEN)
+
+
 @app.route("/analyze", methods=["POST"])
 def analyze():
+    if not _authorized():
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
     try:
         raw = _load_image_bytes()
         if not raw:
